@@ -16,6 +16,8 @@
 
 # ----------------------- 1. Locate project ----------------------------
 
+# Rscript passes the script's own path as "--file=...". Using it lets the
+# script find the data/ and figures/ folders no matter where it is run from.
 args <- commandArgs(trailingOnly = FALSE)
 file_arg <- grep("^--file=", args, value = TRUE)
 
@@ -26,12 +28,14 @@ if (length(file_arg) > 0) {
   )
   script_dir <- dirname(script_path)
 
+  # If the script lives in code/, the project root is one level up.
   project_dir <- if (basename(script_dir) == "code") {
     dirname(script_dir)
   } else {
     script_dir
   }
 } else {
+  # Fallback for interactive use (e.g. RStudio): use the working directory.
   project_dir <- getwd()
 }
 
@@ -44,7 +48,10 @@ EXPR_FILE <- file.path(
 DATA_DIR <- file.path(project_dir, "data")
 FIGURES_DIR <- file.path(project_dir, "figures")
 
+# The data are already normalized; the unit is not specified, so say so.
 Y_LABEL <- "Normalized expression (as provided)"
+
+# Locus IDs are used to find genes; the names are used in figures.
 GENES <- c(REM16 = "LOC115699937", FT1 = "LOC115696989")
 
 dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -53,6 +60,7 @@ dir.create(FIGURES_DIR, recursive = TRUE, showWarnings = FALSE)
 cat("Project directory:", project_dir, "\n")
 cat("Input file:", EXPR_FILE, "\n")
 
+# Fail early with a clear message rather than a cryptic read error.
 if (!file.exists(EXPR_FILE)) {
   stop(
     "Cannot find input file:\n", EXPR_FILE,
@@ -64,7 +72,7 @@ if (!file.exists(EXPR_FILE)) {
 
 required_packages <- c("data.table", "ggplot2")
 
-# Use a writable user-specific R library.
+# Install into a user library so the script works without admin rights.
 user_library <- path.expand("~/R/library")
 dir.create(user_library, recursive = TRUE, showWarnings = FALSE)
 .libPaths(unique(c(user_library, .libPaths())))
@@ -92,6 +100,7 @@ if (length(missing_packages) > 0) {
   )
 }
 
+# Re-check after installing, so a failed install stops here with a hint.
 still_missing <- required_packages[
   !vapply(
     required_packages,
@@ -117,6 +126,9 @@ suppressPackageStartupMessages({
 
 # ----------------------- 3. Read data --------------------------------
 
+# fread is fast on a file with >34,000 genes.
+# check.names = FALSE keeps sample names exactly as written (the sex tag
+# is parsed from them later, so they must not be altered).
 dt <- fread(
   EXPR_FILE,
   data.table = FALSE,
@@ -132,9 +144,11 @@ cat(
   ncol(dt) - 1, "samples\n"
 )
 
+# Layout: column 1 = gene IDs, remaining columns = one plant each.
 gene_ids <- trimws(as.character(dt[[1]]))
 sample_ids <- trimws(names(dt)[-1])
 
+# --- Data-structure checks: report problems instead of failing silently ---
 if (anyNA(gene_ids) || any(!nzchar(gene_ids))) {
   warning("Some gene IDs in column 1 are empty or missing.")
 }
@@ -157,7 +171,8 @@ if (anyDuplicated(gene_ids)) {
   )
 }
 
-# Coerce sample columns to numeric, as in the original script.
+# A stray text value would make a whole column non-numeric. Convert to
+# numeric (bad entries become NA) and report which columns were affected.
 non_num <- names(dt)[-1][
   !vapply(dt[-1], is.numeric, logical(1))
 ]
@@ -176,8 +191,9 @@ if (length(non_num) > 0) {
 
 # ----------------------- 4. Extract target genes ---------------------
 
-# Match each exact locus ID as a whole token.
-# Other gene names do not need to begin with "LOC".
+# Match the locus ID as a whole token, so "LOC1156" cannot accidentally
+# match "LOC11569". The boundary pattern also copes with IDs embedded in
+# longer strings (e.g. "gene-LOC115699937").
 find_row <- function(id) {
   which(
     grepl(
@@ -197,6 +213,7 @@ extract_gene <- function(id, gene_name) {
     )
   }
 
+  # If a locus appears more than once, average the rows and say so.
   if (length(idx) > 1) {
     warning(
       gene_name, " (", id, ") found in ", length(idx),
@@ -207,9 +224,12 @@ extract_gene <- function(id, gene_name) {
   m <- as.matrix(dt[idx, -1, drop = FALSE])
   mode(m) <- "numeric"
 
+  # na.rm = FALSE: a missing value stays missing rather than being
+  # silently averaged away. NAs are reported in the QC step below.
   colMeans(m, na.rm = FALSE)
 }
 
+# One row per plant, one column per gene.
 expr <- data.frame(
   sample = sample_ids,
   REM16 = unname(extract_gene(GENES[["REM16"]], "REM16")),
@@ -219,10 +239,13 @@ expr <- data.frame(
 
 # ----------------------- 5. Determine plant sex ----------------------
 
+# Sex is not a separate column: it is encoded as a suffix in the sample
+# name (e.g. "..._XX" or "..._XY"). Take the letters after the last "_".
 tag <- toupper(
   sub(".*_\\s*([A-Za-z]+)\\s*$", "\\1", expr$sample)
 )
 
+# Names without "_" would be returned unchanged by sub(), so set them to NA.
 tag[!grepl("_", expr$sample)] <- NA_character_
 
 expr$sex <- ifelse(
@@ -230,6 +253,7 @@ expr$sex <- ifelse(
   ifelse(tag == "XY", "Male (XY)", NA_character_)
 )
 
+# Show every suffix found, so unexpected tags are easy to spot.
 cat("\nSample-name suffixes found:\n")
 print(table(tag, useNA = "ifany"))
 
@@ -242,6 +266,8 @@ if (anyNA(expr$sex)) {
 
 # ----------------------- 6. Expression QC ----------------------------
 
+# Per-gene sanity check: missing values, negatives, and value range.
+# Missing values here explain any difference in n between plots.
 for (gene_name in names(GENES)) {
   v <- expr[[gene_name]]
   finite_v <- v[is.finite(v)]
@@ -265,6 +291,8 @@ for (gene_name in names(GENES)) {
   ))
 }
 
+# Keep only plants with a recognized sex; fixed factor order keeps
+# Female on the left and Male on the right in every figure.
 dat <- expr[!is.na(expr$sex), , drop = FALSE]
 
 dat$sex <- factor(
@@ -283,6 +311,7 @@ if (nrow(dat) != 138) {
 
 # ----------------------- 7. Summary tables ---------------------------
 
+# Median/mean/SD of each gene within each sex. n counts finite values only.
 summ <- do.call(
   rbind,
   lapply(names(GENES), function(gene_name) {
@@ -307,7 +336,7 @@ summ <- do.call(
 
 print(summ, row.names = FALSE)
 
-# Save tabular results in data/, not figures/.
+# Tabular results go in data/, figures go in figures/.
 fwrite(
   dat[, c("sample", "sex", names(GENES))],
   file.path(DATA_DIR, "REM16_FT1_extracted.csv")
@@ -320,11 +349,14 @@ fwrite(
 
 # ----------------------- 8. Figures ----------------------------------
 
+# One colour per sex, reused in every figure for consistency.
 sex_cols <- c(
   "Female (XX)" = "#C2185B",
   "Male (XY)" = "#1976D2"
 )
 
+# Global plot style. The x-axis already names the sex, so the legend is
+# off by default (the combined figure turns it back on).
 theme_set(
   theme_bw(base_size = 13) +
     theme(
@@ -335,15 +367,23 @@ theme_set(
     )
 )
 
+# Build x-axis labels like "Female (XX)\nn = 69".
+# NOTE: this counts every plant in the data it is given, including plants
+# with a missing value for the gene being plotted.
 n_lab <- function(d) {
   tab <- table(d$sex)
   paste0(names(tab), "\nn = ", as.integer(tab))
 }
 
+# Box plot + individual points for one gene, with a Wilcoxon test in the
+# subtitle. Wilcoxon is used because expression values need not be normal.
 single_plot <- function(gene_name) {
+  # Drop missing values for this gene only, so n matches what is plotted.
   d <- dat[is.finite(dat[[gene_name]]), , drop = FALSE]
   d$val <- d[[gene_name]]
 
+  # exact = FALSE avoids warnings when there are tied values;
+  # tryCatch keeps one failed test from stopping the whole script.
   p_value <- tryCatch(
     wilcox.test(
       val ~ sex,
@@ -356,6 +396,7 @@ single_plot <- function(gene_name) {
   subtitle <- if (is.na(p_value)) {
     NULL
   } else {
+    # eps floors very small p-values and prints them as "<1e-16".
     paste0(
       "Wilcoxon rank-sum test: p = ",
       format.pval(p_value, digits = 2, eps = 1e-16)
@@ -363,6 +404,8 @@ single_plot <- function(gene_name) {
   }
 
   ggplot(d, aes(sex, val, fill = sex)) +
+    # Outliers are hidden in the box plot because every plant is already
+    # shown as a jittered point.
     geom_boxplot(
       outlier.shape = NA,
       width = 0.55,
@@ -388,8 +431,7 @@ single_plot <- function(gene_name) {
 p1 <- single_plot("REM16")
 p2 <- single_plot("FT1")
 
-# Save each plot directly to PNG. Do not print plots to the default
-# graphics device, which can create Rplots.pdf in non-interactive R.
+# Save straight to PNG.
 ggsave(
   filename = file.path(FIGURES_DIR, "Fig1_REM16_by_sex.png"),
   plot = p1,
@@ -406,6 +448,7 @@ ggsave(
   dpi = 300
 )
 
+# Combined figure: stack both genes into long format so ggplot can facet.
 long <- rbind(
   data.frame(
     sex = dat$sex,
@@ -422,6 +465,10 @@ long <- rbind(
 long <- long[is.finite(long$value), , drop = FALSE]
 long$gene <- factor(long$gene, levels = c("REM16", "FT1"))
 
+# Free y-axes are needed because the two genes sit on very different
+# scales (REM16 ~8-11, FT1 ~6-8); a shared axis would flatten FT1.
+# NOTE: n_lab(dat) counts all plants, so the FT1 panel shows the same n
+# as REM16 even if a plant with a missing FT1 value was dropped from it.
 p3 <- ggplot(long, aes(sex, value, fill = sex)) +
   geom_boxplot(
     outlier.shape = NA,
@@ -458,6 +505,7 @@ ggsave(
 
 # ----------------------- 9. Session information ----------------------
 
+# Record R and package versions so the analysis can be reproduced.
 writeLines(
   capture.output(sessionInfo()),
   file.path(DATA_DIR, "sessionInfo.txt")
