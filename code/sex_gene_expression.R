@@ -6,6 +6,21 @@
 #   - sex encoded in the sample name suffix: _XX = female, _XY = male
 # =====================================================================
 
+# Install required packages if they are not already installed
+required_packages <- c("data.table", "ggplot2")
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(
+    missing_packages,
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+# Load required packages
 suppressPackageStartupMessages({
   library(data.table)
   library(ggplot2)
